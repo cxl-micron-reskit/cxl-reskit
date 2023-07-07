@@ -1,0 +1,767 @@
+#!/bin/bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2022 Micron Technology, Inc.
+
+VERBOSE=1
+STRICT=0
+ROOT_PREFIX=
+
+(( __KB = 1024 ))
+(( __MB = 1024 * 1024 ))
+(( __GB = 1024 * 1024 * 1024 ))
+
+# ------------------------------------------------------------------------------------------------
+# Utility Functions Start (db4de81e-a31e-491d-a9dc-17a3e63be914)
+# ------------------------------------------------------------------------------------------------
+
+#
+# on_linux
+#     major_kernel_version : out
+#     major_kernel_version : out
+#
+# Places the major kernel version in the first argument and the minor version
+# in the second argument.
+#
+function on_linux()
+{
+    if [[ "$(uname | tr '[:upper:]' '[:lower:]')" == "linux" ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+#
+# which_linux
+#     distro_string : out
+#     distro        : out
+#
+# Places the distro name in the first argument and a short-form name (i.e., ubuntu or fedora)
+# in the second argument.
+#
+function which_linux()
+{
+    local -n __wl_distro_str_out=$1
+    local -n __wl_distro_out=$2
+    local __wl_hd
+    local __wl_md
+
+    if [[ -f "${ROOT_PREFIX}"/etc/os-release ]]; then
+        __wl_hd=$(awk -F= '/^NAME/{print $2}' "${ROOT_PREFIX}"/etc/os-release | tr -d \")
+        __wl_md=$( echo "${__wl_hd}" | cut -d ' ' -f 1 | tr '[:upper:]' '[:lower:]' )
+    else
+        __wl_hd=unknown
+        __wl_md=unknown
+    fi
+
+    __wl_distro_str_out=${__wl_hd}
+    __wl_distro_out=${__wl_md}
+}
+
+function version_to_major_minor()
+{
+    local __vtmm_version_str=${1}
+    local -n __vtmm_major_ver_out=${2}
+    local -n __vtmm_minor_ver_out=${3}
+
+    local __vtmm_major_ver
+    local __vtmm_minor_ver
+
+    if [[ "${__vtmm_version_str}" =~ ([[:digit:]]+)\.([[:digit:]]+) ]] ; then
+        __vtmm_major_ver=${BASH_REMATCH[1]}
+        __vtmm_minor_ver=${BASH_REMATCH[2]}
+    elif [[ "${__vtmm_version_str}" =~ ([[:digit:]]+) ]] ; then
+        __vtmm_major_ver=${BASH_REMATCH[1]}
+        __vtmm_minor_ver=0
+    fi
+
+    __vtmm_major_ver_out=${__vtmm_major_ver}
+    __vtmm_minor_ver_out=${__vtmm_minor_ver}
+}
+
+#
+# version_gt
+#     lhs_major_version : in
+#     lhs_minor_version : in
+#     rhs_major_version : in
+#     rhs_minor_version : in
+#
+# Returns shell true/false if the left hand side major/minor version pair is greater
+# than the right hand side major/minor version pair.
+#
+function version_gt()
+{
+    local lhs_major=${1}
+    local lhs_minor=${2}
+    local rhs_major=${3}
+    local rhs_minor=${4}
+
+    if [[ "${lhs_major}" -gt "${rhs_major}" ]]; then
+        return 0
+    elif [[ "${lhs_major}" -eq "${rhs_major}" && \
+            "${lhs_minor}" -gt "${rhs_minor}"  ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+#
+# version_gte
+#     lhs_major_version : in
+#     lhs_minor_version : in
+#     rhs_major_version : in
+#     rhs_minor_version : in
+#
+# Returns shell true/false if the left hand side major/minor version pair is greater
+# than or equal to the right hand side major/minor version pair.
+#
+function version_gte()
+{
+    local lhs_major=${1}
+    local lhs_minor=${2}
+    local rhs_major=${3}
+    local rhs_minor=${4}
+
+    if [[ "${lhs_major}" -gt "${rhs_major}" ]]; then
+        return 0
+    elif [[ "${lhs_major}" -eq "${rhs_major}" &&   \
+            ( "${lhs_minor}" -gt "${rhs_minor}" || \
+              "${lhs_minor}" -eq "${rhs_minor}" ) ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+#
+# min_kernel_version
+#     minimum_major_version : in
+#     minimum_minor_version : in
+#
+# Returns shell true/false based on whether the currently running kernel meets the
+# minimum version specified by the caller.
+#
+function min_kernel_ver()
+{
+    local min_major=$1
+    local min_minor=$2
+    local kv_major
+    local kv_minor
+
+    version_to_major_minor "$(uname -r)" kv_major kv_minor
+    if version_gte "${kv_major}" "${kv_minor}" "${min_major}" "${min_minor}" ; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+#
+# get_kernel_cxl_options
+#     config : in
+#
+# NOTE - This function relies on a global associative array called CXL_OPTIONS
+#
+# This function scans the kernel configuration file passed as an argument, looking
+# for CXL options. It has a set of known variables that it is looking for but will
+# add others to the array if they are found.
+#
+function get_kernel_cxl_options()
+{
+    local config=${1}
+    local tmp
+
+    CXL_OPTIONS[CONFIG_CXL_BUS]=""
+    CXL_OPTIONS[CONFIG_CXL_PCI]=""
+    CXL_OPTIONS[CONFIG_CXL_MEM_RAW_COMMANDS]=""
+    CXL_OPTIONS[CONFIG_CXL_ACPI]=""
+    CXL_OPTIONS[CONFIG_CXL_PMEM]=""
+    CXL_OPTIONS[CONFIG_CXL_MEM]=""
+    CXL_OPTIONS[CONFIG_CXL_PORT]=""
+    CXL_OPTIONS[CONFIG_CXL_REGION]=""
+
+    if [[ -f "${config}" && -r "${config}" ]]; then
+        while read -r tmp; do
+            if [[ "${tmp}" =~ (CONFIG_CXL_[[:alpha:]_]+)[[:space:]]*=[[:space:]]*([[:alnum:]]+) ]]
+            then
+                CXL_OPTIONS[${BASH_REMATCH[1]}]=${BASH_REMATCH[2]}
+            fi
+        done < <(grep CONFIG_CXL "${config}")
+    fi
+}
+
+#
+# get_cxl_device_info
+#
+# NOTE - This function relies on a global associative array called CXL_DEVICES
+#
+# This function finds the devices in /sys/bus/cxl and attempts to learn everything
+# it can about them.
+#
+function get_cxl_device_info()
+{
+    local device_entries
+    local device_entry
+    local tmp_array
+    local module_name
+    local module_pcie_dev
+    local pcie_link_string
+
+    CXL_SYSFS_ROOT=/sys/bus/cxl
+    if [[ -d ${CXL_SYSFS_ROOT} && -x ${CXL_SYSFS_ROOT}/devices ]]; then
+        if [[ $(ls "${CXL_SYSFS_ROOT}/devices" | wc -l) == 0 ]] ; then
+            return 0
+        fi
+        devices_entries=$(ls -l ${CXL_SYSFS_ROOT}/devices | tail -n +2)
+        while read -r device_entry; do
+            read -ra tmp_array <<<"${device_entry}"
+            if (( ${#tmp_array[@]} == 11 )) ; then
+                module_name=${tmp_array[8]}
+                pcie_link_string=${tmp_array[10]}
+                if [[ ${pcie_link_string} =~ ../../../devices/[^/]+/([^/]+)/([[:alnum:]]+) ]]
+                then
+                    module_pcie_dev=${BASH_REMATCH[1]}
+                else
+                    echo "Warning - CXL device detected with an unrecognized PCIe device link:"
+                    echo "              ${pcie_link_string}"
+                    echo "          Device will be ignored."
+                    continue
+                fi
+                CXL_DEVICES["${module_name}"]="${module_pcie_dev}"
+            else
+                echo "Warning - Device listing in ${CXL_SYSFS_ROOT}/devices in unknown format:"
+                echo "              ${device_entry}"
+                echo "          Device will be ignored."
+                continue
+            fi
+        done <<< "${devices_entries}"
+    fi
+}
+
+#
+# print_cxl_device_info
+#
+# NOTE - This function relies on a global associative array called CXL_DEVICES
+#
+# This function uses the information that get_cxl_defice_info populated in
+# and prints out information it can find can about them using lspci.
+#
+function print_cxl_device_info()
+{
+    if [[ "${#CXL_DEVICES[@]}" == 0 ]] ; then
+        echo -e "          No devices found"
+        return 0
+    fi
+
+    for device in "${!CXL_DEVICES[@]}" ; do
+        address="${CXL_DEVICES[${device}]}"
+        vendor=
+        device_id=
+        lspci_begin_line=$(lspci -D -mm -vv | grep -n "${CXL_DEVICES[${device}]}" | cut -d : -f 1)
+        lspci_block=$(lspci -D -mm -vv | tail -n +"${lspci_begin_line}" | sed '/^$/Q')
+        while read -r lspci_field; do
+            label=$(echo "${lspci_field}" | cut -d : -f 1 | tr -d " " )
+            value=$(echo "${lspci_field}" | cut -d : -f 2 | tr -d "\t" | sed -r 's/^( )//g')
+            if [[ "${label}" == Class && "${value}" != CXL ]] ; then
+                echo "Warning - Apparent device class mismatch for ${device}, expected CXL. Got"
+                echo "          ${value}"
+            fi
+            if [[ "${label}" == Vendor ]] ; then
+                vendor="${value}"
+            elif [[ "${label}" == Device ]] ; then
+                device_id="${value}"
+            fi
+        done <<< "${lspci_block}"
+
+        device_size="<unknown>"
+        if [[ "${CXL_DEVICES[${device}]}" =~ ([[:alnum:]]+):([[:alnum:]]+): ]] ; then
+            pcie_group="${BASH_REMATCH[1]}"
+            pcie_devid="${BASH_REMATCH[2]}"
+            size_file="/sys/devices/pci${pcie_group}:${pcie_devid}/${address}/${device}/ram/size"
+            if [[ -f "${size_file}" && -r "${size_file}" ]] ; then
+                device_size=$(cat "${size_file}")
+            fi
+        fi
+
+        if [[ "${device_size}" != "<unknown>" ]] ; then
+            (( device_size = (device_size / __GB) ))
+        fi
+
+        echo -e "            CXL Device : ${device}"
+        echo -e "                Vendor : ${vendor}"
+        echo -e "             Device ID : ${device_id}"
+        echo -e "          PCIe Address : ${CXL_DEVICES[${device}]}"
+        echo -e "                  Size : ${device_size} GB"
+        echo -ne "       Mailbox Present : "
+
+        if [[ -c "/dev/cxl/${device}" ]] ; then
+            echo -e "yes"
+        else
+            echo -e "no"
+        fi
+    done
+}
+
+#
+# get_dax_device_names
+#
+# NOTE - This function relies on a global array called DAX_DEVICES
+#
+# This function finds DAX devices present in the system and populates the
+# DAX_DEVICES array with their names.
+#
+function get_dax_device_names()
+{
+    local name
+
+    while read -r name ; do
+        if [[ ! -z "${name}" ]] ; then
+            DAX_DEVICES+=("${name}")
+        fi
+    done <<< $(find /dev -name dax\*)
+}
+
+#
+# print_dax_device_info
+#
+# NOTE - This function relies on a global associative array called CXL_DEVICES
+#
+# This function uses the information that get_cxl_defice_info populated in
+# and prints out information it can find can about them using lspci.
+#
+function print_dax_device_info()
+{
+    local tmpfile
+    local field
+    local chardev
+    local size="<unknown>"
+    local mode
+    local iomem_entry
+    local mem_base
+    local mem_top
+    local mem_range
+    local mem_range_known=0
+
+    if [[ "${#DAX_DEVICES[@]}" == 0 ]] ; then
+        echo -e "          No devices found"
+        return 0
+    fi
+
+    if (( "${DAXCTL_PRESENT}" == 0 )); then
+        for chardev in "${DAX_DEVICES[@]}" ; do
+            echo -e "                  Name : ${chardev##*/}"
+            echo -e "                  Path : ${chardev}"
+        done
+        return 0
+    fi
+
+    if ! tmpfile=$(mktemp /tmp/cxlstat.XXXXXXXXXXXXXXXX); then
+        echo "Error creating temporary file to hold output from daxctl list"
+        return 1
+    fi
+
+    if ! daxctl list > "${tmpfile}" ; then
+        echo "Error running daxctl list"
+        return 1
+    fi
+
+    while read -r bracket_line ; do
+        (( start_line = bracket_line + 1 ))
+        end_line=$(tail -n +"${start_line}" < "${tmpfile}" | grep -n "}" | cut -d : -f 1 | head -1)
+        (( end_line = end_line - 1 ))
+        device_data=$(tail -n +"${start_line}" < "${tmpfile}" | head -"${end_line}")
+
+        while read -r field ; do
+            label=$(echo "${field}" | cut -d : -f 1 | tr -d " " | tr -d \")
+            value=$(echo "${field}" | cut -d : -f 2 | tr -d "," | tr -d \")
+
+            if [[ "${label}" == "chardev" ]] ; then
+                chardev="${value}"
+            elif [[ "${label}" == "size" ]] ; then
+                size="${value}"
+            elif [[ "${label}" == "mode" ]] ; then
+                mode="${value}"
+            fi
+        done <<< "${device_data}"
+
+        if [[ "${size}" != "<unknown>" ]] ; then
+            (( size = (size / __GB) ))
+        fi
+
+        if [[ $EUID == 0 ]] ; then
+            iomem_entry=$(grep "${chardev}" /proc/iomem)
+            if [[ "${iomem_entry}" =~ [[:space:]]*([[:alnum:]]+)-([[:alnum:]]+) ]] ; then
+                mem_base=$(echo "${BASH_REMATCH[1]}" | tr '[:lower:]' '[:upper:]')
+                mem_top=$(echo "${BASH_REMATCH[2]}" | tr '[:lower:]' '[:upper:]')
+                mem_range=$(echo "ibase=16; 1 + ${mem_top} - ${mem_base}" | bc)
+                (( mem_range = (mem_range / __GB) ))
+                mem_range_known=1
+            else
+                echo -e "Warning, unexpected format of /proc/iomem entry: ${iomem_entry}"
+            fi
+        fi
+
+        echo -e "                  Name : ${chardev}"
+        echo -e "                  Path : /dev/${chardev}"
+        echo -e "                  Size : ${size} GB"
+        if (( mem_range_known == 1 )) ; then
+            echo -e "      Memory HPA Range : 0x${mem_base}-0x${mem_top} (${mem_range} GB)"
+        else
+            echo -e "      Memory HPA Range : UNKNOWN (run as root to see HPA range)"
+        fi
+        if [[ "${mode}" == "devdax" ]] ; then
+            echo -e "                  Mode : ${mode} (memory directly usable only via DAX access)"
+        else
+            echo -e "                  Mode : ${mode} (memory directly usable, e.g. via numactl)"
+        fi
+    done <<< "$(grep -n \{ < ${tmpfile} | cut -d : -f 1)"
+
+    rm "${tmpfile}"
+}
+
+#
+# deb_package_check
+#     package_name       : in
+#     package_installed  : out
+#     package_version    : out
+#     package_upgradable : out
+#
+# Checks whether the package given by the supplied name is installed and sets the second
+# argument to 0/1 accordingly. If it is installed, then the third argument and fourth
+# arguments respectively are set to the major and minor version of the package. The fifth
+# argument is set to 0/1 if the package is-not/is currently upgradable
+#
+function deb_package_check()
+{
+    local __dpc_package_nm=$1
+    local -n __dpc_installed_out=$2
+    local -n __dpc_major_ver_out=$3
+    local -n __dpc_minor_ver_out=$4
+    local -n __dpc_upgradable_out=$5
+
+    local __dpc_installed
+    local __dpc_major_ver
+    local __dpc_minor_ver
+    local __dpc_upgradable
+    local __dpc_tmp
+
+    if dpkg -s "${__dpc_package_nm}" > /dev/null 2>&1 ; then
+        __dpc_installed=1
+    else
+        __dpc_installed=0
+        __dpc_major_ver=0
+        __dpc_minor_ver=0
+        __dpc_upgradable=0
+    fi
+
+    if (( "${__dpc_installed}" == 1 )); then
+        __dpc_tmp=$(dpkg -s "${__dpc_package_nm}" | grep Version | cut -d ' ' -f 2)
+        if [[ "${__dpc_tmp}" =~ ([0-9]+):(.*) ]] ; then
+            # there is an epoch for the version, ignore it
+            __dpc_tmp=${BASH_REMATCH[2]}
+            if [[ "${__dpc_tmp}" =~ (.*)-([[:alnum:]]*) ]] ; then
+                # there a debian version string on the end, ignore it
+                __dpc_tmp=${BASH_REMATCH[1]}
+            fi
+        fi
+
+        version_to_major_minor "${__dpc_tmp}" __dpc_major_ver __dpc_minor_ver
+
+        if apt-get -s upgrade | grep "${__dpc_package_nm}" > /dev/null 2>&1 ; then
+           __dpc_upgradable=1
+        else
+           __dpc_upgradable=0
+        fi
+    fi
+
+    __dpc_installed_out=${__dpc_installed}
+    __dpc_major_ver_out=${__dpc_major_ver}
+    __dpc_minor_ver_out=${__dpc_minor_ver}
+    __dpc_upgradable_out=${__dpc_upgradable}
+}
+
+#
+# rpm_check_upgradable
+#     package_name          : in
+#     package_major_version : in
+#     package_minor_version : in
+#
+# Checks whether the package given by the supplied name is upgradable, defined as being
+# Returns shell true/false if the package given by the supplied name is upgradable.
+# A package is upgradable if dnf lists a version that is greater than the given version
+#
+function rpm_check_upgradable()
+{
+    local package_nm=$1
+    local curr_major_ver=$2
+    local curr_minor_ver=$3
+
+    local tmp_major_ver
+    local tmp_minor_ver
+    local version
+
+    for version in $(dnf -C -q --showduplicates list --available  "${package_nm}" | \
+                       grep "${package_nm}" 2>&1                                  | \
+                       tr -s " "                                                  | \
+                       cut -d ' ' -f 2)
+    do
+        version_to_major_minor "${version}" tmp_major_ver tmp_minor_ver
+        if version_gt "${tmp_major_ver}"  "${tmp_minor_ver}" \
+                      "${curr_major_ver}" "${curr_major_ver}" ; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+#
+# rpm_package_check
+#     package_name       : in
+#     package_installed  : out
+#     package_version    : out
+#     package_upgradable : out
+#
+# Checks whether the package given by the supplied name is installed and sets the second
+# argument to 0/1 accordingly. If it is installed, then the third argument and fourth
+# arguments respectively are set to the major and minor version of the package. The fifth
+# argument is set to 0/1 if the package is-not/is currently upgradable
+#
+function rpm_package_check()
+{
+    local __rpc_package_nm=$1
+    local -n __rpc_installed_out=$2
+    local -n __rpc_major_ver_out=$3
+    local -n __rpc_minor_ver_out=$4
+    local -n __rpc_upgradable_out=$5
+
+    local __rpc_installed
+    local __rpc_major_ver
+    local __rpc_minor_ver
+    local __rpc_upgradable
+    local __rpc_tmp
+
+    if rpm -q -s "${__rpc_package_nm}" > /dev/null 2>&1 ; then
+        __rpc_installed=1
+    else
+        __rpc_installed=0
+        __rpc_major_ver=0
+        __rpc_minor_ver=0
+        __rpc_upgradable=0
+    fi
+
+    if (( "${__rpc_installed}" == 1 )); then
+        __rpc_tmp=$(rpm -q --queryformat '%{VERSION}' "${__rpc_package_nm}")
+        if [[ "${__rpc_tmp}" =~ ([[:digit:]]+).([[:digit:]]+) ]] ; then
+            __rpc_major_ver=${BASH_REMATCH[1]}
+            __rpc_minor_ver=${BASH_REMATCH[2]}
+        elif [[ "${__rpc_tmp}" =~ ([[:digit:]]+) ]] ; then
+            __rpc_major_ver=${BASH_REMATCH[1]}
+            __rpc_minor_ver=0
+        fi
+
+        if rpm_check_upgradable "${__rpc_package_nm}" "${__rpc_major_ver}" "${__rpc_minor_ver}"
+        then
+            __rpc_upgradable=1
+        else
+            __rpc_upgradable=0
+        fi
+    fi
+
+    __rpc_installed_out=${__rpc_installed}
+    __rpc_major_ver_out=${__rpc_major_ver}
+    __rpc_minor_ver_out=${__rpc_minor_ver}
+    __rpc_upgradable_out=${__rpc_upgradable}
+}
+
+# ------------------------------------------------------------------------------------------------
+# Utility Functions End (db4de81e-a31e-491d-a9dc-17a3e63be914)
+# ------------------------------------------------------------------------------------------------
+
+
+
+# ------------------------------------------------------------------------------------------------
+#
+# Primary Execution Sequence
+#
+# ------------------------------------------------------------------------------------------------
+
+#
+# Check if the system is running Linux
+#
+if ! on_linux ; then
+    echo "${0} is only supported on Linux, exiting"
+    exit 1
+fi
+
+
+#
+# Check to see whether we booted via UEFI or BIOS
+#
+
+if [[ -d "${ROOT_PREFIX}"/sys/firmware/efi ]]; then
+    UEFI_MODE=1
+    (( "${VERBOSE}" == 1 )) && echo "System booted using UEFI"
+else
+    UEFI_MODE=0
+    (( "${VERBOSE}" == 1 )) && echo "System booted using BIOS"
+fi
+
+
+#
+# Vet the OS installation and kernel version
+#
+
+KERNEL_MAJOR_VER_MIN=5
+KERNEL_MINOR_VER_MIN=15
+KERNEL_VER_MIN_STR=${KERNEL_MAJOR_VER_MIN}.${KERNEL_MINOR_VER_MIN}
+
+# Set up the distro information
+which_linux LINUX_DISTRO_STR LINUX_DISTRO
+(( "${VERBOSE}" == 1 )) && echo "Detected ${LINUX_DISTRO_STR}"
+if [[ "${LINUX_DISTRO}" != ubuntu && "${LINUX_DISTRO}" != fedora ]]; then
+    echo "Warning - Running one of Fedora Core (version 36 or later) or Ubuntu"
+    echo "          (version 22.04 LTS or later) is suggested"
+    if (( "${STRICT}" == 1 )); then
+        exit 1
+    fi
+fi
+
+# Check if the kernel meets the minimum version requirement
+MIN_KERNEL_VER_MET=0
+
+if ! min_kernel_ver "${KERNEL_MAJOR_VER_MIN}" "${KERNEL_MINOR_VER_MIN}" ; then
+    echo "Warning - Minimum kernel version requirement not met. Currently running"
+    echo "          kernel version $(uname -r) while a kernel of at least version"
+    echo "          ${KERNEL_VER_MIN_STR} is recommended"
+else
+    MIN_KERNEL_VER_MET=1
+    (( "${VERBOSE}" == 1 )) && \
+        echo "Minimum kernel version requirement met - $(uname -r) vs. ${KERNEL_VER_MIN_STR}"
+fi
+
+# Check for kernel boot configuration
+KERN_VER=$(uname -r)
+KERN_CFG=${ROOT_PREFIX}/boot/config-${KERN_VER}
+KERNEL_CFG_KNOWN=0
+if [[ ! -f ${KERN_CFG} ]]; then
+    echo "Kernel compile configuration not in known location, expected ${KERN_CFG}"
+    echo "    The kernel compile options are unknown."
+    if (( "${STRICT}" == 1 )); then
+        exit 1
+    fi
+else
+    (( "${VERBOSE}" == 1 )) && echo "Kernel boot configuration located (${KERN_CFG})"
+    KERNEL_CFG_KNOWN=1
+fi
+
+#
+# Vet available packages
+#
+# Currently we are only looking for daxctl
+#
+
+DAXCTL_USABLE=0
+
+DAXCTL_MAJ_VER_MIN=72
+DAXCTL_MIN_VER_MIN=1
+DAXCTL_VER_MIN="${DAXCTL_MAJ_VER_MIN}.${DAXCTL_MIN_VER_MIN}"
+
+if [[ "${LINUX_DISTRO}" == ubuntu ]]; then
+    deb_package_check daxctl DAXCTL_PRESENT DAXCTL_MAJOR_VER DAXCTL_MINOR_VER DAXCTL_UPGRADABLE
+else
+    rpm_package_check daxctl DAXCTL_PRESENT DAXCTL_MAJOR_VER DAXCTL_MINOR_VER DAXCTL_UPGRADABLE
+fi
+
+echo
+if (( "${DAXCTL_PRESENT}" == 0 )) ; then
+    echo "Package daxctl does not appear to be installed. Please install the latest"
+    echo "version or at least version ${DAXCTL_VER_MIN}. If not available then compile from"
+    echo "source."
+else
+    if version_gte "${DAXCTL_MAJOR_VER}" "${DAXCTL_MINOR_VER}"     \
+                   "${DAXCTL_MAJ_VER_MIN}" "${DAXCTL_MIN_VER_MIN}" ; then
+        DAXCTL_USABLE=1
+        echo -n "The package daxctl is installed and at a sufficient version "
+        echo    "(found ${DAXCTL_MAJOR_VER}.${DAXCTL_MINOR_VER})."
+    else
+        echo -n "The package daxctl is installed but at a version that is too old "
+        echo    "(found ${DAXCTL_MAJOR_VER}.${DAXCTL_MINOR_VER})."
+        if (( DAXCTL_UPGRADABLE == 1 )) ; then
+            echo "The package daxctl can be upgraded. Please upgrade and re-run ${0}."
+        else
+            echo "The package daxctl can't be upgraded. Please compile and install daxctl,"
+            echo "then re-run ${0}."
+        fi
+    fi
+fi
+
+
+#
+# CXL device checks
+#
+
+echo -e "\nDetecting CXL devices ..."
+
+declare -A CXL_DEVICES
+get_cxl_device_info
+print_cxl_device_info
+
+
+#
+# DAX device checks
+#
+
+echo -e "\nDetecting DAX devices ..."
+
+declare -a DAX_DEVICES=()
+get_dax_device_names
+print_dax_device_info
+
+
+if (( "${DAXCTL_PRESENT}" == 1 )); then
+    if (( "${DAXCTL_USABLE}" == 1 )); then
+        echo -e ""
+        echo "The daxctl command appears usable for all normal functions."
+    else
+        echo -e ""
+        echo "The daxctl command may not be usable."
+    fi
+fi
+
+# At this point we know we're running some variation of the minimum kernel version and
+# we may know whether the kernel was configured with CXL support. Next we attempt to
+# determine whether the kernel appears to actually be running with CXL support.
+
+CXLSTAT_MAILBOX_ENABLED=0
+CXLSTAT_MAILBOX_RAW_ENABLED=0
+
+# Attempt to obtain CXL options
+declare -A CXL_OPTIONS
+get_kernel_cxl_options "${KERN_CFG}"
+
+echo
+if (( "${VERBOSE}" == 1 )) ; then
+    if [[ "${CXL_OPTIONS[CONFIG_CXL_MEM]}" == y ||
+          "${CXL_OPTIONS[CONFIG_CXL_MEM]}" == m ]] ; then
+        CXLSTAT_MAILBOX_ENABLED=1
+        if [[ "${CXL_OPTIONS[CONFIG_CXL_MEM_RAW_COMMANDS]}" == y ||
+              "${CXL_OPTIONS[CONFIG_CXL_MEM_RAW_COMMANDS]}" == m ]] ; then
+            CXLSTAT_MAILBOX_RAW_ENABLED=1
+            echo "Standard and vendor-specific CXL mailbox commands may be used."
+        else
+            echo "Standard CXL mailbox commands may be used (no vendor-specific commands allowed)."
+        fi
+    elif (( "${KERNEL_CFG_KNOWN}" == 1 )); then
+        echo "CXL driver stack disabled in your kernel."
+        echo "Note: CXL memory will still work if BIOS and CPU support CXL"
+    else
+        echo "CXL driver stack not detected in your kernel."
+        echo "Note: CXL memory will still work if BIOS and CPU support CXL"
+    fi
+    echo
+fi
+
+exit 0
