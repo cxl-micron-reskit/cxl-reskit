@@ -291,39 +291,11 @@ Usage documentation for all the benchmark tools is in [benchmarks/README.md](ben
 
 ## About MXCLI
 
-`mxcli`, included in the base directory of this repository, is a management and support tool for
-sending CXL mailbox commands to a CXL memory device. `mxcli` can be used to retrieve identity
-and health information about a CXL device, read logs, issue resets, and
-perform other support actions. It also has options to access standard PCIe capability and extended
-capability registers along with non-standard CXL specific DVSEC and DOE capability control
-registers, making it useful for debug and diagnostics.
+`mxcli`, included as a seperate repository , is a handy application to debug and operate CXL device/s.
+'mxcli` support sending cxl commands over in-band ( Mailbox ) as well sideband ( MCTP/SMBUS ). 
+'mxcli` is useful for firmaware upgrade as well deferent debuging features.
 
-To see the full command line help, use the `./mxcli --help` command.
-If you run `mxcli` with an unqualified command line, it will provide a menu interface.
+`mxcli` has an interactive mode with indexed menus, auto-discovery of CXL devices and
+ auto-completion of commands/fields, making it a self-documenting and intuitive tool.
 
-The following example issues an IDENTIFY mailbox command to a CXL memory device.
-
-```text
-$ sudo ./mxcli -d /dev/cxl/mem0 -cmd identify
-Opening Device: /dev/cxl/mem0
-2022-10-14 15:44:25.950 | INFO     | mxlib.mxlibpy.cmds.mailbox.mbox:send_command:158 - Mailbox cmd=0 - ret_code=0
-{
-    "fw_revision": "01.000.008.00",
-    "total_capacity": 512,
-    "volatile_capacity": 512,
-    "persistent_capacity": 0,
-    "partition_align": 0,
-    "info_event_log_size": 16,
-    "warning_event_log_size": 16,
-    "failure_event_log_size": 16,
-    "fatal_event_log_size": 16,
-    "lsa_size": 0,
-    "poison_list_max_mer": 0,
-    "inject_poison_limit": 0,
-    "poison_caps": 0,
-    "qos_telemetry_caps": 0
-}
-```
-
-`mxcli` also has an interactive mode with indexed menus, auto-discovery of CXL devices and
-auto-completion of commands/fields, making it a self-documenting and intuitive tool.
+- More details : https://github.com/cxl-micron-reskit/mxcli#
